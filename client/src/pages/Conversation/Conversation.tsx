@@ -1,5 +1,5 @@
 import { FC, MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSocket } from "./hooks/useSocket";
+import { useSocket, SocketConfig } from "./hooks/useSocket";
 import { SocketContext } from "./SocketContext";
 import { ServerAudio } from "./components/ServerAudio/ServerAudio";
 import { UserAudio } from "./components/UserAudio/UserAudio";
@@ -29,50 +29,16 @@ type ConversationProps = {
 } & Partial<ModelParamsValues>;
 
 
-const buildURL = ({
-  workerAddr,
-  params,
-  workerAuthId,
-  email,
-  textSeed,
-  audioSeed,
-}: {
-  workerAddr: string;
-  params: ModelParamsValues;
-  workerAuthId?: string;
-  email?: string;
-  textSeed: number;
-  audioSeed: number;
-}) => {
-  const newWorkerAddr = useMemo(() => {
-    if (workerAddr == "same" || workerAddr == "") {
-      const newWorkerAddr = window.location.hostname + ":" + window.location.port;
-      console.log("Overriding workerAddr to", newWorkerAddr);
-      return newWorkerAddr;
-    }
-    return workerAddr;
-  }, [workerAddr]);
+const buildURL = (workerAddr: string): string => {
+  let resolvedAddr = workerAddr;
+  if (workerAddr === "same" || workerAddr === "") {
+    resolvedAddr = window.location.hostname + ":" + window.location.port;
+    console.log("Overriding workerAddr to", resolvedAddr);
+  }
   const wsProtocol = (window.location.protocol === 'https:') ? 'wss' : 'ws';
-  const url = new URL(`${wsProtocol}://${newWorkerAddr}/api/chat`);
-  if(workerAuthId) {
-    url.searchParams.append("worker_auth_id", workerAuthId);
-  }
-  if(email) {
-    url.searchParams.append("email", email);
-  }
-  url.searchParams.append("text_temperature", params.textTemperature.toString());
-  url.searchParams.append("text_topk", params.textTopk.toString());
-  url.searchParams.append("audio_temperature", params.audioTemperature.toString());
-  url.searchParams.append("audio_topk", params.audioTopk.toString());
-  url.searchParams.append("pad_mult", params.padMult.toString());
-  url.searchParams.append("text_seed", textSeed.toString());
-  url.searchParams.append("audio_seed", audioSeed.toString());
-  url.searchParams.append("repetition_penalty_context", params.repetitionPenaltyContext.toString());
-  url.searchParams.append("repetition_penalty", params.repetitionPenalty.toString());
-  url.searchParams.append("text_prompt", params.textPrompt.toString());
-  url.searchParams.append("voice_prompt", params.voicePrompt.toString());
-  console.log(url.toString());
-  return url.toString();
+  const url = `${wsProtocol}://${resolvedAddr}/api/chat`;
+  console.log("WebSocket URL:", url);
+  return url;
 };
 
 
@@ -110,17 +76,16 @@ export const Conversation:FC<ConversationProps> = ({
   const micDuration = useRef<number>(0);
   const actualAudioPlayed = useRef<number>(0);
   const textContainerRef = useRef<HTMLDivElement>(null);
-  const textSeed = useMemo(() => Math.round(1000000 * Math.random()), []);
-  const audioSeed = useMemo(() => Math.round(1000000 * Math.random()), []);
+  const seed = useMemo(() => Math.round(1000000 * Math.random()), []);
 
-  const WSURL = buildURL({
-    workerAddr,
-    params: modelParams,
-    workerAuthId,
-    email: email,
-    textSeed: textSeed,
-    audioSeed: audioSeed,
-  });
+  const WSURL = useMemo(() => buildURL(workerAddr), [workerAddr]);
+  
+  // Build config to send as first message
+  const socketConfig: SocketConfig = useMemo(() => ({
+    voice_prompt: modelParams.voicePrompt,
+    text_prompt: modelParams.textPrompt,
+    seed: seed,
+  }), [modelParams.voicePrompt, modelParams.textPrompt, seed]);
 
   const onDisconnect = useCallback(() => {
     setIsOver(true);
@@ -131,6 +96,7 @@ export const Conversation:FC<ConversationProps> = ({
   const { socketStatus, sendMessage, socket, start, stop } = useSocket({
     // onMessage,
     uri: WSURL,
+    config: socketConfig,
     onDisconnect,
   });
   useEffect(() => {

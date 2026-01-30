@@ -27,6 +27,7 @@
 import argparse
 import asyncio
 from dataclasses import dataclass
+import json
 import random
 import os
 from pathlib import Path
@@ -140,24 +141,51 @@ class ServerState:
         peer_port = request.transport.get_extra_info("peername")[1]  # Port
         clog.log("info", f"Incoming connection from {peer}:{peer_port}")
 
-        # self.lm_gen.temp = float(request.query["audio_temperature"])
-        # self.lm_gen.temp_text = float(request.query["text_temperature"])
-        # self.lm_gen.top_k_text = max(1, int(request.query["text_topk"]))
-        # self.lm_gen.top_k = max(1, int(request.query["audio_topk"]))
+        # Wait for first message containing configuration JSON
+        clog.log("info", "Waiting for config message...")
+        try:
+            config_msg = await asyncio.wait_for(ws.receive(), timeout=30.0)
+        except asyncio.TimeoutError:
+            clog.log("error", "Timeout waiting for config message")
+            await ws.close(code=4000, message=b"Timeout waiting for config")
+            return ws
         
+        if config_msg.type == aiohttp.WSMsgType.TEXT:
+            config_data = config_msg.data
+        elif config_msg.type == aiohttp.WSMsgType.BINARY:
+            config_data = config_msg.data.decode("utf-8")
+        else:
+            clog.log("error", f"Expected config message, got {config_msg.type}")
+            await ws.close(code=4001, message=b"Expected JSON config as first message")
+            return ws
+        
+        try:
+            config = json.loads(config_data)
+        except json.JSONDecodeError as e:
+            clog.log("error", f"Invalid JSON config: {e}")
+            await ws.close(code=4002, message=b"Invalid JSON config")
+            return ws
+        
+        # Extract config values with defaults
+        voice_prompt_filename = config.get("voice_prompt", "NATF2.pt")
+        text_prompt = config.get("text_prompt", "")
+        seed = config.get("seed", None)
+        
+        clog.log("info", f"Config received: voice_prompt={voice_prompt_filename}, text_prompt={text_prompt[:50]}{'...' if len(text_prompt) > 50 else ''}, seed={seed}")
+
         # Construct full voice prompt path
         requested_voice_prompt_path = None
         voice_prompt_path = None
         if self.voice_prompt_dir is not None:
-            voice_prompt_filename = request.query["voice_prompt"]
             requested_voice_prompt_path = None
             if voice_prompt_filename is not None:
                 requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
-            # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
+            # If the voice prompt file does not exist, raise an error
             if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
-                raise FileNotFoundError(
-                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
-                )
+                error_msg = f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
+                clog.log("error", error_msg)
+                await ws.close(code=4003, message=error_msg.encode("utf-8")[:123])  # WebSocket close reason max 123 bytes
+                return ws
             else:
                 voice_prompt_path = requested_voice_prompt_path
                 
@@ -167,8 +195,7 @@ class ServerState:
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = int(request["seed"]) if "seed" in request.query else None
+        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if len(text_prompt) > 0 else None
 
         async def recv_loop():
             nonlocal close
@@ -251,10 +278,10 @@ class ServerState:
                     await ws.send_bytes(b"\x01" + msg)
 
         clog.log("info", "accepted connection")
-        if len(request.query["text_prompt"]) > 0:
-            clog.log("info", f"text prompt: {request.query['text_prompt']}")
-        if len(request.query["voice_prompt"]) > 0:
-            clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
+        if len(text_prompt) > 0:
+            clog.log("info", f"text prompt: {text_prompt}")
+        if voice_prompt_filename:
+            clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {voice_prompt_filename})")
         close = False
         async with self.lock:
             if seed is not None and seed != -1:

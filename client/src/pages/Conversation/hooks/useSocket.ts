@@ -2,13 +2,21 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { WSMessage, SocketStatus } from "../../../protocol/types";
 import { decodeMessage, encodeMessage } from "../../../protocol/encoder";
 
+export interface SocketConfig {
+  voice_prompt: string;
+  text_prompt: string;
+  seed?: number;
+}
+
 export const useSocket = ({
   onMessage,
   uri,
+  config,
   onDisconnect: onDisconnectProp,
 }: {
   onMessage?: (message: WSMessage) => void;
   uri: string;
+  config: SocketConfig;
   onDisconnect?: () => void;
 }) => {
   const lastMessageTime = useRef<null|number>(null);
@@ -27,9 +35,15 @@ export const useSocket = ({
   );
 
   const onConnect = useCallback(() => {
-    console.log("connected, now waiting for handshake.");
+    console.log("connected, sending config...");
     setSocketStatus("connecting");
-  }, [setSocketStatus]);
+    // Send config as first message
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      const configJson = JSON.stringify(config);
+      console.log("Sending config:", configJson);
+      socketRef.current.send(configJson);
+    }
+  }, [setSocketStatus, config]);
 
   const onDisconnect = useCallback((event: CloseEvent) => {
     const closedSocket = event.target as WebSocket;
