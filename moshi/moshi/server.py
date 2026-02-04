@@ -198,7 +198,7 @@ class ServerState:
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if len(text_prompt) > 0 else None
 
         async def recv_loop():
-            nonlocal close
+            nonlocal close, restart_requested
             try:
                 async for message in ws:
                     if message.type == aiohttp.WSMsgType.ERROR:
@@ -222,17 +222,29 @@ class ServerState:
                     if kind == 1:  # audio
                         payload = message[1:]
                         opus_reader.append_bytes(payload)
+                    elif kind == 3:  # control
+                        if len(message) < 2:
+                            clog.log("warning", "control message too short")
+                            continue
+                        control_type = message[1]
+                        if control_type == 3:  # restart
+                            clog.log("info", "restart requested by client")
+                            restart_requested = True
+                            return  # Exit recv_loop to trigger restart
+                        else:
+                            clog.log("warning", f"unknown control type {control_type}")
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
-                close = True
-                clog.log("info", "connection closed")
+                if not restart_requested:
+                    close = True
+                clog.log("info", "recv_loop exiting")
 
         async def opus_loop():
             all_pcm_data = None
 
             while True:
-                if close:
+                if close or restart_requested:
                     return
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
@@ -270,7 +282,7 @@ class ServerState:
 
         async def send_loop():
             while True:
-                if close:
+                if close or restart_requested:
                     return
                 await asyncio.sleep(0.001)
                 msg = opus_writer.read_bytes()
@@ -283,55 +295,77 @@ class ServerState:
         if voice_prompt_filename:
             clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {voice_prompt_filename})")
         close = False
+        restart_requested = False
+        
         async with self.lock:
-            if seed is not None and seed != -1:
-                seed_all(seed)
+            # Main conversation loop - restarts when restart_requested is True
+            while not close:
+                restart_requested = False
+                
+                if seed is not None and seed != -1:
+                    seed_all(seed)
 
-            opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
-            opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
-            self.mimi.reset_streaming()
-            self.other_mimi.reset_streaming()
-            self.lm_gen.reset_streaming()
-            async def is_alive():
-                if close or ws.closed:
-                    return False
-                try:
-                    # Check for disconnect without waiting too long
-                    msg = await asyncio.wait_for(ws.receive(), timeout=0.01)
-                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
+                opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+                self.mimi.reset_streaming()
+                self.other_mimi.reset_streaming()
+                self.lm_gen.reset_streaming()
+                
+                async def is_alive():
+                    if close or ws.closed:
                         return False
-                except asyncio.TimeoutError:
-                    # No messages → client probably still alive
-                    return True
-                except aiohttp.ClientConnectionError:
-                    return False
-                return True
-            # Reuse mimi for encoding voice prompt and then reset it before conversation starts
-            await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
-            self.mimi.reset_streaming()
-            clog.log("info", "done with system prompts")
-            # Send the handshake.
-            if await is_alive():
-                await ws.send_bytes(b"\x00")
-                clog.log("info", "sent handshake bytes")
-                # Clean cancellation manager
-                tasks = [
-                    asyncio.create_task(recv_loop()),
-                    asyncio.create_task(opus_loop()),
-                    asyncio.create_task(send_loop()),
-                ]
-
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                # Force-kill remaining tasks
-                for task in pending:
-                    task.cancel()
                     try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                        # Check for disconnect without waiting too long
+                        msg = await asyncio.wait_for(ws.receive(), timeout=0.01)
+                        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            return False
+                    except asyncio.TimeoutError:
+                        # No messages → client probably still alive
+                        return True
+                    except aiohttp.ClientConnectionError:
+                        return False
+                    return True
+                
+                # Reuse mimi for encoding voice prompt and then reset it before conversation starts
+                await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+                self.mimi.reset_streaming()
+                clog.log("info", "done with system prompts")
+                
+                # Send the handshake.
+                if await is_alive():
+                    await ws.send_bytes(b"\x00")
+                    clog.log("info", "sent handshake bytes")
+                    
+                    # Clean cancellation manager
+                    tasks = [
+                        asyncio.create_task(recv_loop()),
+                        asyncio.create_task(opus_loop()),
+                        asyncio.create_task(send_loop()),
+                    ]
+
+                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    
+                    # Force-kill remaining tasks
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    
+                    # Check if restart was requested
+                    if restart_requested and not close:
+                        clog.log("info", "restarting conversation session")
+                        close = False  # Reset close flag for restart
+                        continue  # Restart the loop
+                    else:
+                        break  # Exit the loop if no restart
+                else:
+                    break
+            
+            if not ws.closed:
                 await ws.close()
-                clog.log("info", "session closed")
-                # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+            clog.log("info", "session closed")
         clog.log("info", "done with connection")
         return ws
 
